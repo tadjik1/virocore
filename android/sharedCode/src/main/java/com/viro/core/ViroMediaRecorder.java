@@ -247,7 +247,7 @@ public class ViroMediaRecorder {
      See https://developer.android.com/guide/topics/media/media-formats.html#audio-formats.
      */
     private int mAudioSamplingBitRate = 44100;
-    private int mAudioEncodingBitRate = mAudioSamplingBitRate * 16;
+    private int mAudioEncodingBitRate = 128_000;
     private int mAudioEncoder = MediaRecorder.AudioEncoder.AAC;
 
     ViroMediaRecorder(Context context, Renderer rendererJni, int width, int height) {
@@ -506,7 +506,7 @@ public class ViroMediaRecorder {
         mRecorder.setAudioEncoder(mAudioEncoder);
         mRecorder.setAudioEncodingBitRate(mAudioEncodingBitRate);
         mRecorder.setAudioSamplingRate(mAudioSamplingBitRate);
-        mRecorder.setVideoEncodingBitRate(7000000);
+        mRecorder.setVideoEncodingBitRate(4000000);
         mRecorder.setVideoFrameRate(30);
         mRecorder.setVideoSize(width, height);
     }
@@ -878,6 +878,77 @@ public class ViroMediaRecorder {
         }
     }
 
+    /**
+     * Emergency abort of an in-flight recording for the activity-pause path.
+     * Only called from {@link com.viro.core.ViroViewARCore#onActivityPaused}
+     * when the GL thread appears stuck waiting on this recorder's input-surface
+     * BufferQueue (common on Xiaomi HyperOS due to audio HAL contention between
+     * MediaRecorder.AudioSource.MIC and concurrent AudioTrack playback).
+     *
+     * Aborts rather than gracefully stops: the in-flight recording may be
+     * truncated and its MP4 file may be missing its moov atom (unplayable).
+     * This is an emergency unblock, not a normal stop — callers should use
+     * {@link #stopRecordingAsync} for clean recording termination.
+     *
+     * Runs synchronously on the calling thread (expected: main). Safe to call
+     * when no recording is active (no-op).
+     */
+    public synchronized void releaseForActivityPause() {
+        if (!mIsRecording || mRecorder == null) return;
+
+        // Stop the producer side first so no new frames are pushed into the
+        // BufferQueue while we're tearing it down.
+        try {
+            nativeEnableFrameRecording(mNativeRecorderRef, false);
+        } catch (Throwable ignored) {}
+
+        // Abandon the consumer side: destroying the input surface marks the
+        // BufferQueue as abandoned, which causes any in-flight dequeueBuffer()
+        // on the GL thread to return with abandoned status and unblock.
+        try {
+            if (mInputSurface != null) {
+                mInputSurface.destroy();
+            }
+        } catch (Throwable ignored) {}
+
+        // MediaRecorder.stop() may throw if no frames were muxed before the
+        // abort — ignore, we're not trying to produce a valid file here.
+        try {
+            mRecorder.stop();
+        } catch (RuntimeException ignored) {}
+
+        try {
+            mRecorder.release();
+        } catch (Throwable ignored) {}
+
+        mRecorder = null;
+        mInputSurface = null;
+        mIsRecording = false;
+        mPendingStopRecording.set(false);
+        mVideoRecordingErrorDelegate = null;
+        mVideoRecordingFilename = null;
+    }
+
+    /**
+     * Configure a watermark image to be composited onto each recorded frame.
+     * Must be called before startRecordingAsync(). Coordinates are normalized
+     * [0..1] from the output frame's top-left.
+     *
+     * @param bitmap the watermark image (ARGB_8888, typically a transparent PNG)
+     * @param x normalized left edge
+     * @param y normalized top edge
+     * @param width normalized width
+     * @param height normalized height
+     */
+    public void configureWatermark(android.graphics.Bitmap bitmap, float x, float y, float width, float height) {
+        nativeSetWatermark(mNativeRecorderRef, bitmap, x, y, width, height);
+    }
+
+    /** Remove any configured watermark. Safe to call when none is set. */
+    public void clearWatermark() {
+        nativeClearWatermark(mNativeRecorderRef);
+    }
+
     /*
      Native calls to the renderer.
      */
@@ -885,4 +956,7 @@ public class ViroMediaRecorder {
     private native void nativeDeleteNativeRecorder(long nativeRecorderRef);
     private native void nativeEnableFrameRecording(long nativeRecorderRef, boolean enabled);
     private native void nativeScheduleScreenCapture(long nativeRecorderRef);
+    private native void nativeSetWatermark(long nativeRecorderRef, android.graphics.Bitmap bitmap,
+                                           float x, float y, float width, float height);
+    private native void nativeClearWatermark(long nativeRecorderRef);
 }

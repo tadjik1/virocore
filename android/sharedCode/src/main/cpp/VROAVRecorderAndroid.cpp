@@ -31,6 +31,7 @@
 #include "VROImagePostProcess.h"
 #include "VRORecorderEglSurfaceDisplay.h"
 #include "VRORenderToTextureDelegateAndroid.h"
+#include "VROTexture.h"
 #include "jni/MediaRecorder_JNI.h"
 
 VROAVRecorderAndroid::VROAVRecorderAndroid(std::shared_ptr<MediaRecorder_JNI> jRecorder) {
@@ -53,6 +54,36 @@ void VROAVRecorderAndroid::init(std::shared_ptr<VRODriver> driver) {
     std::shared_ptr<VROShaderProgram> blitShader
             = VROImageShaderProgram::create(blitSamplers, blitCode, driver);
     _recordingPostProcess = driver->newImagePostProcess(blitShader);
+
+    // Watermark shader: samples a texture with premultiplied-ish alpha. The
+    // caller enables GL_BLEND around the blit so alpha controls the composite.
+    // Android bitmaps are loaded top-down (row 0 = top of image) while GL
+    // texture coordinates are bottom-up (y=0 = bottom). Flip the y-coord when
+    // sampling so the watermark renders upright.
+    std::vector<std::string> watermarkSamplers = { "watermark_texture" };
+    std::vector<std::string> watermarkCode = {
+            "uniform sampler2D watermark_texture;",
+            "frag_color = texture(watermark_texture, vec2(v_texcoord.x, 1.0 - v_texcoord.y));"
+    };
+    std::shared_ptr<VROShaderProgram> watermarkShader
+            = VROImageShaderProgram::create(watermarkSamplers, watermarkCode, driver);
+    _watermarkPostProcess = driver->newImagePostProcess(watermarkShader);
+}
+
+void VROAVRecorderAndroid::setWatermark(std::shared_ptr<VROTexture> texture, VROVector4f normalizedFrame) {
+    if (!texture) {
+        clearWatermark();
+        return;
+    }
+    _watermarkTexture = texture;
+    _watermarkFrame = normalizedFrame;
+    _addWatermark = true;
+}
+
+void VROAVRecorderAndroid::clearWatermark() {
+    _addWatermark = false;
+    _watermarkTexture.reset();
+    _watermarkFrame = VROVector4f();
 }
 
 std::shared_ptr<VRORenderToTextureDelegateAndroid> VROAVRecorderAndroid::getRenderToTextureDelegate() {
@@ -95,6 +126,33 @@ bool VROAVRecorderAndroid::onRenderedFrameTexture(std::shared_ptr<VRORenderTarge
             getGammaPostProcess(driver)->blit({ input->getTexture(0) }, driver);
         } else {
             _recordingPostProcess->blit({ input->getTexture(0) }, driver);
+        }
+
+        // Composite the watermark on top of the scene, as an alpha-blended
+        // quad at the normalized frame. The recorder display is already bound.
+        if (_addWatermark && _watermarkTexture && _watermarkPostProcess) {
+            int surfaceW = input->getWidth();
+            int surfaceH = input->getHeight();
+            int wx  = (int) (_watermarkFrame.x * surfaceW);
+            int wy  = (int) (_watermarkFrame.y * surfaceH);  // top-left origin
+            int ww  = (int) (_watermarkFrame.z * surfaceW);
+            int wh  = (int) (_watermarkFrame.w * surfaceH);
+            // GL viewport origin is bottom-left; flip the y-axis.
+            int glY = surfaceH - wy - wh;
+            if (ww > 0 && wh > 0) {
+                GL( glEnable(GL_BLEND) );
+                GL( glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA) );
+                GL( glViewport(wx, glY, ww, wh) );
+                GL( glScissor(wx, glY, ww, wh) );
+
+                _watermarkPostProcess->blit({ _watermarkTexture }, driver);
+
+                // Restore full-surface viewport/scissor for any subsequent work
+                // on this frame, and turn blending off so we don't leak state.
+                GL( glViewport(0, 0, surfaceW, surfaceH) );
+                GL( glScissor(0, 0, surfaceW, surfaceH) );
+                GL( glDisable(GL_BLEND) );
+            }
         }
     }
 

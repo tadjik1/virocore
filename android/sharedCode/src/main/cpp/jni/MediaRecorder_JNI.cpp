@@ -26,6 +26,9 @@
 #include "MediaRecorder_JNI.h"
 #include "VRORenderer_JNI.h"
 #include "VROChoreographer.h"
+#include "VROImageAndroid.h"
+#include "VROTexture.h"
+#include "VROVector4f.h"
 
 #if VRO_PLATFORM_ANDROID
 #define VRO_METHOD(return_type, method_name) \
@@ -68,6 +71,35 @@ VRO_METHOD(void, nativeScheduleScreenCapture)(VRO_ARGS
     std::shared_ptr<MediaRecorder_JNI> recorder = MediaRecorder::native(jRecorderRef);
     VROPlatformDispatchAsyncRenderer([recorder] {
         recorder->nativeScheduleScreenCapture();
+    });
+}
+
+VRO_METHOD(void, nativeSetWatermark)(VRO_ARGS
+                                     jlong jRecorderRef,
+                                     jobject jBitmap,
+                                     jfloat x, jfloat y, jfloat w, jfloat h) {
+    std::shared_ptr<MediaRecorder_JNI> recorder = MediaRecorder::native(jRecorderRef);
+
+    // Build the texture now on the calling thread so we can safely release the
+    // local Bitmap reference. The VROImageAndroid holds its own global ref and
+    // the texture will hydrate lazily when first bound during the watermark blit.
+    std::shared_ptr<VROTexture> texture;
+    if (jBitmap != nullptr) {
+        std::shared_ptr<VROImage> image = std::make_shared<VROImageAndroid>(jBitmap);
+        texture = std::make_shared<VROTexture>(/* sRGB */ true, VROMipmapMode::None, image);
+    }
+
+    VROVector4f frame(x, y, w, h);
+    VROPlatformDispatchAsyncRenderer([recorder, texture, frame] {
+        recorder->nativeSetWatermark(texture, frame);
+    });
+}
+
+VRO_METHOD(void, nativeClearWatermark)(VRO_ARGS
+                                       jlong jRecorderRef) {
+    std::shared_ptr<MediaRecorder_JNI> recorder = MediaRecorder::native(jRecorderRef);
+    VROPlatformDispatchAsyncRenderer([recorder] {
+        recorder->nativeClearWatermark();
     });
 }
 } // extern "C"
@@ -119,6 +151,18 @@ void MediaRecorder_JNI::nativeScheduleScreenCapture() {
     std::shared_ptr<VRORenderToTextureDelegateAndroid> delegate = _nativeMediaRecorder->getRenderToTextureDelegate();
     choreographer->setRenderToTextureDelegate(delegate);
     _nativeMediaRecorder->scheduleScreenCapture();
+}
+
+void MediaRecorder_JNI::nativeSetWatermark(std::shared_ptr<VROTexture> texture, VROVector4f frame) {
+    if (_nativeMediaRecorder) {
+        _nativeMediaRecorder->setWatermark(texture, frame);
+    }
+}
+
+void MediaRecorder_JNI::nativeClearWatermark() {
+    if (_nativeMediaRecorder) {
+        _nativeMediaRecorder->clearWatermark();
+    }
 }
 
 /*

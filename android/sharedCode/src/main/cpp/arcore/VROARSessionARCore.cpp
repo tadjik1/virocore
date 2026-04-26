@@ -35,6 +35,7 @@
 #include "VROCameraTexture.h"
 #include "VROCloudAnchorProviderARCore.h"
 #include "VROCloudAnchorProviderReactVision.h"
+#include "VRODiagnostics.h"
 #include <fstream>
 
 #ifndef RVCCA_AVAILABLE
@@ -109,6 +110,10 @@ VROARSessionARCore::VROARSessionARCore(std::shared_ptr<VRODriverOpenGL> driver)
 void VROARSessionARCore::setARCoreSession(
     arcore::Session *session,
     std::shared_ptr<VROFrameSynchronizer> synchronizer) {
+  // Pick up any sysprop change since last session. Lifecycle-rare, ~10µs.
+  VRODiagnostics::refresh();
+  VRO_DIAG("Session", "setARCoreSession enter session=%p verbose=%d",
+           session, (int)VRODiagnostics::isVerboseEnabled());
   _session = session;
   _synchronizer = synchronizer;
 
@@ -120,6 +125,8 @@ void VROARSessionARCore::setARCoreSession(
       std::make_shared<VROCloudAnchorProviderARCore>(shared_from_this());
   _synchronizer->addFrameListener(_cloudAnchorProvider);
   _frame = _session->createFrame();
+  VRO_DIAG("Session", "setARCoreSession exit frame=%p db=%p",
+           _frame, _currentARCoreImageDatabase);
 }
 
 GLuint VROARSessionARCore::getCameraTextureId() const {
@@ -171,9 +178,17 @@ void VROARSessionARCore::initCameraTexture(
 }
 
 VROARSessionARCore::~VROARSessionARCore() {
+  // Progress markers — Sentry stack on Xiaomi shows this destructor crashing
+  // inside an unsymbolicated frame. The next-to-last marker before the crash
+  // tells us which step blew up.
+  VRO_DIAG("Session", "[dtor] enter this=%p frame=%p session=%p anchors=%zu db=%p rotImg=%p",
+           this, _frame, _session, _anchors.size(),
+           _currentARCoreImageDatabase, _rotatedImageData);
+
   if (_frame) {
     delete (_frame);
   }
+  VRO_DIAG("Session", "[dtor] frame deleted");
 
   // Remove all anchors
   pinfo("Removing all anchors (%d) from session", (int)_anchors.size());
@@ -185,6 +200,7 @@ VROARSessionARCore::~VROARSessionARCore() {
       pinfo("   Removed anchor %p on session destroy", anchor->getId().c_str());
     }
   }
+  VRO_DIAG("Session", "[dtor] anchors removed (%zu)", anchorsToRemove.size());
 
   if (_session != nullptr) {
     pinfo("Destroying ARCore session");
@@ -192,22 +208,42 @@ VROARSessionARCore::~VROARSessionARCore() {
     // Deleting the session could take a few seconds, so to prevent blocking the
     // main thread, they recommend pausing the session, then deleting on a
     // background thread!
+    //
+    // The capture MUST be the raw pointer value, not `this`. By the time the
+    // background task runs, this VROARSessionARCore has been destructed and
+    // `this->_session` is a dangling read. Capturing the pointer by value and
+    // nulling the member locks the deletion to a stable target.
     _session->pause();
-    VROPlatformDispatchAsyncBackground([this] { delete (_session); });
-
-    if (_currentARCoreImageDatabase != nullptr) {
-      delete (_currentARCoreImageDatabase);
-    }
+    VRO_DIAG("Session", "[dtor] session paused, dispatching delete to bg");
+    arcore::Session *sessionToDelete = _session;
+    _session = nullptr;
+    VROPlatformDispatchAsyncBackground([sessionToDelete] {
+      VRO_DIAG("Session", "[dtor] bg delete session=%p start", sessionToDelete);
+      delete sessionToDelete;
+      VRO_DIAG("Session", "[dtor] bg delete session=%p done", sessionToDelete);
+    });
   }
+
+  // The image database must be deleted regardless of session state — it's
+  // allocated in setARCoreSession() but the session and database lifetimes
+  // can diverge if the session was never fully established.
+  if (_currentARCoreImageDatabase != nullptr) {
+    delete (_currentARCoreImageDatabase);
+    _currentARCoreImageDatabase = nullptr;
+  }
+  VRO_DIAG("Session", "[dtor] image db cleaned");
 
   if (_rotatedImageData != nullptr) {
     free(_rotatedImageData);
   }
+  VRO_DIAG("Session", "[dtor] exit");
 }
 
 #pragma mark - Lifecycle and Setup
 
 void VROARSessionARCore::run() {
+  // Re-read sysprop on every resume so the tester can toggle without a restart.
+  VRODiagnostics::refresh();
   if (_session != nullptr) {
     // ARCore requires setCameraTextureName to be called after every pause/resume cycle.
     // Re-register here so the camera stream is always wired to our OES texture before
@@ -216,8 +252,11 @@ void VROARSessionARCore::run() {
       _session->setCameraTextureName(_cameraTextureId);
     }
     _session->resume();
+    VRO_DIAG("Session", "run() resumed session=%p verbose=%d",
+             _session, (int)VRODiagnostics::isVerboseEnabled());
     pinfo("AR session resumed");
   } else {
+    VRO_DIAG("Session", "run() skipped: session not configured");
     pinfo("AR session not resumed: has not yet been configured");
   }
 }
@@ -225,8 +264,10 @@ void VROARSessionARCore::run() {
 void VROARSessionARCore::pause() {
   if (_session != nullptr) {
     _session->pause();
+    VRO_DIAG("Session", "pause() paused session=%p", _session);
     pinfo("AR session paused");
   } else {
+    VRO_DIAG("Session", "pause() skipped: session not configured");
     pinfo("AR session not paused: has not yet been configured");
   }
 }
@@ -857,6 +898,21 @@ std::unique_ptr<VROARFrame> &VROARSessionARCore::updateFrame() {
 
   VROARFrameARCore *arFrame = (VROARFrameARCore *)_currentFrame.get();
   arFrame->setDriver(_driver.lock());
+
+  // Tracking-state transition log. Sysprop-gated, so prod cost is one atomic
+  // load + one int compare per frame. Reveals HyperOS camera-throttling: the
+  // state will flap NotTracking <-> Tracking even though the user is holding
+  // the device steady, indicating the OS is starving the camera.
+  if (VRODiagnostics::isVerboseEnabled()) {
+    arcore::TrackingState ts = _frame->getTrackingState();
+    if (ts != _lastTrackingState) {
+      VRO_DIAG_V("Tracking", "state change %d -> %d (frame=%d)",
+                 (int)_lastTrackingState, (int)ts, _frameCount);
+      _lastTrackingState = ts;
+    }
+  }
+  _frameCount++;
+
   processUpdatedAnchors(arFrame);
   updateDepthTexture();
   if (isSemanticModeEnabled()) {

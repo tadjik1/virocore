@@ -39,6 +39,7 @@
 #include "arcore/VROARSessionARCore.h"
 #include "arcore/VROARFrameARCore.h"
 #include "arcore/VROARCameraARCore.h"
+#include "VRODiagnostics.h"
 
 #include "VRODriverOpenGLAndroid.h"
 #include "VROGVRUtil.h"
@@ -524,17 +525,22 @@ void VROSceneRendererARCore::onResume() {
 
 void VROSceneRendererARCore::onDestroy() {
     if (_destroyed) {
+        VRO_DIAG("Renderer", "onDestroy: already destroyed, skipping");
         return;
     }
     _destroyed = true;
+    VRO_DIAG("Renderer", "onDestroy: enter session=%p sceneCtl=%p renderer=%p driver=%p",
+             _session.get(), _sceneController.get(), _renderer.get(), _driver.get());
 
     // Pause the AR session
     if (_session) {
         _session->pause();
     }
+    VRO_DIAG("Renderer", "onDestroy: session paused");
 
     // Reset camera background surface to release texture
     _cameraBackground.reset();
+    VRO_DIAG("Renderer", "onDestroy: camera bg reset");
 
     // Clean up scene controller and its resources
     if (_sceneController) {
@@ -543,18 +549,22 @@ void VROSceneRendererARCore::onDestroy() {
         }
         _sceneController.reset();
     }
+    VRO_DIAG("Renderer", "onDestroy: scene controller reset");
 
     // Reset point of view
     _pointOfView.reset();
 
     // Reset renderer (releases GPU resources, frame synchronizer, etc.)
     _renderer.reset();
+    VRO_DIAG("Renderer", "onDestroy: renderer reset");
 
     // Reset AR session (triggers its destructor which cleans up ARCore)
     _session.reset();
+    VRO_DIAG("Renderer", "onDestroy: session reset");
 
     // Reset driver LAST as other objects depend on it
     _driver.reset();
+    VRO_DIAG("Renderer", "onDestroy: exit");
 }
 
 void VROSceneRendererARCore::setVRModeEnabled(bool enabled) {

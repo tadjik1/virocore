@@ -301,6 +301,10 @@ private:
     arcore::Frame *_frame;
     int _frameCount;
 
+    // Diagnostics: most-recent ARCore tracking state, used to log transitions.
+    // Initialized to NotTracking so the first real state change always logs.
+    arcore::TrackingState _lastTrackingState = arcore::TrackingState::NotTracking;
+
     /*
      The last computed ARFrame.
      */

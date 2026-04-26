@@ -45,6 +45,7 @@
     bool _isFirstRecordingFrame;
     bool _saveToCameraRoll;
     bool _addWatermark;
+    bool _watermarkFrameIsNormalized;
     bool _saveGif;
     bool _useMicrophone;
     UIImage *_watermarkImage;
@@ -90,6 +91,7 @@
         _renderer = renderer;
         _driver = driver;
         _addWatermark = false;
+        _watermarkFrameIsNormalized = false;
         _saveGif = false;
         _videoPixelBuffer = NULL;
         _gifDestination = NULL;
@@ -206,8 +208,24 @@
                  errorBlock:(VROViewRecordingErrorBlock)errorBlock {
     if (watermarkImage) {
         _addWatermark = true;
+        _watermarkFrameIsNormalized = false;
         _watermarkImage = watermarkImage;
         _watermarkFrame = watermarkFrame;
+    }
+
+    [self startVideoRecording:fileName saveToCameraRoll:saveToCamera errorBlock:errorBlock];
+}
+
+- (void)startVideoRecording:(NSString *)fileName
+              withWatermark:(UIImage *)watermarkImage
+        withNormalizedFrame:(CGRect)normalizedFrame
+           saveToCameraRoll:(BOOL)saveToCamera
+                 errorBlock:(VROViewRecordingErrorBlock)errorBlock {
+    if (watermarkImage) {
+        _addWatermark = true;
+        _watermarkFrameIsNormalized = true;
+        _watermarkImage = watermarkImage;
+        _watermarkFrame = normalizedFrame;
     }
 
     [self startVideoRecording:fileName saveToCameraRoll:saveToCamera errorBlock:errorBlock];
@@ -535,6 +553,17 @@
         return;
     }
 
+    // Cap the longest side at 1080p. Pro-tier iPhones have backing stores well above
+    // 1920 on the long edge, and social-sharing targets re-encode to 1080p anyway —
+    // recording above that just inflates file size with no visible gain.
+    const int kVROMaxRecordingDimension = 1920;
+    int longestSide = MAX(width, height);
+    if (longestSide > kVROMaxRecordingDimension) {
+        double scale = (double)kVROMaxRecordingDimension / (double)longestSide;
+        width  = (int)(width  * scale);
+        height = (int)(height * scale);
+    }
+
     /*
      * https://stackoverflow.com/questions/29505631/crop-video-in-ios-see-weird-green-line-around-video
      * The video width & height need to be even
@@ -550,7 +579,7 @@
                                    AVVideoWidthKey : @(width),
                                    AVVideoHeightKey : @(height),
                                    AVVideoCompressionPropertiesKey:
-                                     @{AVVideoAverageBitRateKey : @(11000000),
+                                     @{AVVideoAverageBitRateKey : @(4000000),
                                        }
                                    };
     
@@ -623,8 +652,16 @@
         }
 
         // create a UIImage with size divided by the contentScaleFactor!
-        UIGraphicsBeginImageContextWithOptions(CGSizeMake(width/view.contentScaleFactor, height/view.contentScaleFactor), NO, view.contentScaleFactor);
-        [_watermarkImage drawInRect:CGRectMake(_watermarkFrame.origin.x, _watermarkFrame.origin.y , _watermarkFrame.size.width, _watermarkFrame.size.height)];
+        CGFloat pointWidth = width / view.contentScaleFactor;
+        CGFloat pointHeight = height / view.contentScaleFactor;
+        UIGraphicsBeginImageContextWithOptions(CGSizeMake(pointWidth, pointHeight), NO, view.contentScaleFactor);
+        CGRect effectiveFrame = _watermarkFrameIsNormalized
+            ? CGRectMake(_watermarkFrame.origin.x * pointWidth,
+                         _watermarkFrame.origin.y * pointHeight,
+                         _watermarkFrame.size.width * pointWidth,
+                         _watermarkFrame.size.height * pointHeight)
+            : _watermarkFrame;
+        [_watermarkImage drawInRect:effectiveFrame];
         UIImage *newImage = UIGraphicsGetImageFromCurrentImageContext();
         UIGraphicsEndImageContext();
         

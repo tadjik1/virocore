@@ -28,6 +28,7 @@
 
 #include "VROVideoTexture.h"
 #include "VROOpenGL.h"
+#include "VROVector4f.h"
 
 class VRODriverOpenGL;
 class VROImagePostProcess;
@@ -35,6 +36,7 @@ class VRORecorderEglSurfaceDisplay;
 class MediaRecorder_JNI;
 class VRORenderTarget;
 class VRORenderToTextureDelegateAndroid;
+class VROTexture;
 
 /*
  VROAVRecorderAndroid contains the native implementation of ViroMediaRecorder.java that
@@ -88,6 +90,14 @@ public:
      */
     void eglSwap();
 
+    /*
+     Configure a watermark image to be composited onto each recorded frame.
+     The frame (x, y, width, height) is interpreted as normalized [0..1] from
+     the output frame's top-left. Pass an empty texture to clear the watermark.
+     */
+    void setWatermark(std::shared_ptr<VROTexture> texture, VROVector4f normalizedFrame);
+    void clearWatermark();
+
 private:
     /*
      True if a video recording currently occurring and we are binding egl surfaces and swapping them.
@@ -126,6 +136,17 @@ private:
      Post process to gamma correct screen shots.
      */
     std::shared_ptr<VROImagePostProcess> _gammaPostProcess;
+
+    /*
+     Watermark compositing state. When _addWatermark is true, after the scene
+     blit in onRenderedFrameTexture we draw the watermark texture as an
+     alpha-blended quad at _watermarkFrame. Coordinates are normalized [0..1]
+     from the output surface's top-left.
+     */
+    bool _addWatermark = false;
+    std::shared_ptr<VROTexture> _watermarkTexture;
+    VROVector4f _watermarkFrame;
+    std::shared_ptr<VROImagePostProcess> _watermarkPostProcess;
 
     /*
      Weak reference to the native-to-java jni interface for triggering java callbacks.

@@ -58,6 +58,8 @@ public:
     void nativeCreateRecorder(std::shared_ptr<VROSceneRenderer> renderer);
     void nativeEnableFrameRecording(bool isRecording);
     void nativeScheduleScreenCapture();
+    void nativeSetWatermark(std::shared_ptr<VROTexture> texture, VROVector4f frame);
+    void nativeClearWatermark();
 
     // Native to java calls
     void onBindToEGLSurface();

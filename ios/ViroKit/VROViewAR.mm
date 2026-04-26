@@ -507,6 +507,14 @@ static inline VROMatrix4f viroGLConvTransform(VROMatrix4f t) {
 }
 
 - (void)startVideoRecording:(NSString *)fileName
+              withWatermark:(UIImage *)watermarkImage
+        withNormalizedFrame:(CGRect)normalizedFrame
+           saveToCameraRoll:(BOOL)saveToCamera
+                 errorBlock:(VROViewRecordingErrorBlock)errorBlock {
+    [self.viewRecorder startVideoRecording:fileName withWatermark:watermarkImage withNormalizedFrame:normalizedFrame saveToCameraRoll:saveToCamera errorBlock:errorBlock];
+}
+
+- (void)startVideoRecording:(NSString *)fileName
                     gifFile:(NSString *)gifFile
               withWatermark:(UIImage *)watermarkImage
                   withFrame:(CGRect)watermarkFrame

@@ -131,6 +131,7 @@ add_library( # Sets the name of the library.
              ${VIRO_RENDERER_SRC}/VROAllocationTracker.cpp
              ${VIRO_RENDERER_SRC}/VROTime.cpp
              ${VIRO_RENDERER_SRC}/VROLog.cpp
+             ${VIRO_RENDERER_SRC}/VRODiagnostics.cpp
              ${VIRO_RENDERER_SRC}/VROByteBuffer.cpp
              ${VIRO_RENDERER_SRC}/VROImageUtil.cpp
              ${VIRO_RENDERER_SRC}/VROData.cpp

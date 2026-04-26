@@ -65,6 +65,13 @@ enum class VROTimingFunctionType;
            saveToCameraRoll:(BOOL)saveToCamera
                  errorBlock:(VROViewRecordingErrorBlock)errorBlock;
 
+// Watermark variant that interprets the frame as normalized [0..1] coordinates.
+- (void)startVideoRecording:(NSString *)fileName
+              withWatermark:(UIImage *)watermarkImage
+        withNormalizedFrame:(CGRect)normalizedFrame
+           saveToCameraRoll:(BOOL)saveToCamera
+                 errorBlock:(VROViewRecordingErrorBlock)errorBlock;
+
 - (void)startVideoRecording:(NSString *)fileName
                     gifFile:(NSString *)gifFile
               withWatermark:(UIImage *)watermarkImage

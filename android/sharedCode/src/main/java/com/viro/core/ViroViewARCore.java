@@ -31,6 +31,7 @@ import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Point;
 import android.opengl.EGL14;
+import android.opengl.GLES20;
 import android.opengl.GLSurfaceView;
 import android.os.Bundle;
 import android.os.Handler;
@@ -439,6 +440,11 @@ public class ViroViewARCore extends ViroView {
     private boolean mAppRequestedInstall = true;
     private boolean mUserRequestedInstall = false;
 
+    // Diagnostics: track lifecycle cadence so we can spot HyperOS-style spurious
+    // pause/resume cycles (pair fires within ~50ms while user is still in foreground).
+    private long mLastLifecycleEventMs = 0;
+    private static final String DIAG_TAG = "Viro.Lifecycle";
+
     /**
      * Create a new ViroViewARCore with the default {@link RendererConfiguration}. This constructor
      * will immediately throw a {@link DeviceNotCompatibleException} if ARCore is not compatible with
@@ -535,6 +541,12 @@ public class ViroViewARCore extends ViroView {
         System.loadLibrary("viro_arcore");
 
         mSurfaceView = new GLSurfaceView(context);
+        // AR is always active use: rendering a live camera stream while the user
+        // holds the device still. Consumer apps can forget to call useKeepAwake()
+        // or lose the window flag during navigation transitions, and a 30s display
+        // timeout (not uncommon) will blank the screen mid-session. Pin it at the
+        // view level so the wake lock holds as long as the surface is attached.
+        mSurfaceView.setKeepScreenOn(true);
         addView(mSurfaceView);
 
         // Add a globally accessible ImageView used to display the tracking output for debugging
@@ -787,11 +799,82 @@ public class ViroViewARCore extends ViroView {
             return;
         }
 
+        long now = android.os.SystemClock.uptimeMillis();
+        long deltaMs = mLastLifecycleEventMs > 0 ? now - mLastLifecycleEventMs : -1;
+        mLastLifecycleEventMs = now;
+        // Capture every signal we can about *why* this pause fired. Spurious
+        // HyperOS pauses come back with hasFocus=false isFinishing=false and
+        // a quick paired resume — that pattern lets us fingerprint them.
+        boolean isFinishing = activity.isFinishing();
+        boolean isChanging = activity.isChangingConfigurations();
+        boolean isMW = false;
+        try { isMW = activity.isInMultiWindowMode(); } catch (Throwable t) { /* API < 24 */ }
+        boolean hasFocus = activity.hasWindowFocus();
+        Log.i(DIAG_TAG, "onActivityPaused tid=" + Thread.currentThread().getId()
+                + " dtMs=" + deltaMs
+                + " isFinishing=" + isFinishing
+                + " isChangingCfg=" + isChanging
+                + " multiWindow=" + isMW
+                + " hasFocus=" + hasFocus);
+
+        // Proactively drain the GL thread BEFORE calling mSurfaceView.onPause().
+        // Without this, mSurfaceView.onPause() does Object.wait on the GL thread
+        // and blocks the main thread for as long as the current frame takes to
+        // finish. If the GL thread is mid-frame doing ARCore / recording work
+        // that has any main-thread dependency, the wait can stretch to 10s+
+        // which Android classifies as an ANR and kills the process.
+        //
+        // This matters specifically on aggressive OEM skins (Xiaomi HyperOS,
+        // OxygenOS, One UI) that fire spontaneous Activity.onPause transitions
+        // when media/audio state changes — the user sees no visible background
+        // event but the activity pause cascade still runs. The ONLY reliable
+        // fix is at this layer: make the GL thread idle-able fast so onPause
+        // acknowledges in microseconds instead of waiting for a frame.
+        //
+        // Mirrors the prepareForUnmount() technique but fires automatically
+        // on every pause. All Viro GL resources stay valid — onActivityResumed
+        // picks up rendering cleanly from a paused state.
+        final GLSurfaceView surfaceView = mSurfaceView;
+        if (surfaceView != null) {
+            final Object lock = new Object();
+            final boolean[] drained = {false};
+            surfaceView.queueEvent(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        GLES20.glClearColor(0f, 0f, 0f, 1f);
+                        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
+                        GLES20.glFinish();
+                    } catch (Throwable t) {
+                        // Swallow — proceed to pause regardless.
+                    }
+                    synchronized (lock) {
+                        drained[0] = true;
+                        lock.notifyAll();
+                    }
+                }
+            });
+            // Bounded wait. 300ms is well under Android's 5s pre-ANR window
+            // yet long enough for a healthy GL thread to finish its current
+            // frame and acknowledge. If the GL thread is already deadlocked,
+            // we accept the residual risk rather than turning onActivityPaused
+            // itself into a hang.
+            long drainStart = android.os.SystemClock.uptimeMillis();
+            synchronized (lock) {
+                try {
+                    if (!drained[0]) lock.wait(300);
+                } catch (InterruptedException ignored) {}
+            }
+            Log.i(DIAG_TAG, "GL drain " + (drained[0] ? "ok" : "TIMEOUT")
+                    + " in " + (android.os.SystemClock.uptimeMillis() - drainStart) + "ms");
+        }
+
         // Note that the order matters - GLSurfaceView is paused first so that it does not try
         // to query the session. If Session is paused before GLSurfaceView, GLSurfaceView may
         // still call mSession.update() and get a SessionPausedException.
         mSurfaceView.onPause();
         mNativeRenderer.onPause();
+        Log.i(DIAG_TAG, "onActivityPaused done");
     }
 
     /**
@@ -800,12 +883,21 @@ public class ViroViewARCore extends ViroView {
     @Override
     public void onActivityResumed(Activity activity) {
         if (mNativeRenderer == null || mSurfaceView == null) {
+            Log.i(DIAG_TAG, "onActivityResumed: skipped (renderer/surface null)");
             return;
         }
 
         if (mWeakActivity.get() != activity) {
             return;
         }
+
+        long now = android.os.SystemClock.uptimeMillis();
+        long deltaMs = mLastLifecycleEventMs > 0 ? now - mLastLifecycleEventMs : -1;
+        mLastLifecycleEventMs = now;
+        // dtMs < 500 after a paused pair = HyperOS-style spurious cycle.
+        Log.i(DIAG_TAG, "onActivityResumed tid=" + Thread.currentThread().getId()
+                + " dtMs=" + deltaMs
+                + (deltaMs >= 0 && deltaMs < 500 ? " [SPURIOUS_CYCLE_SUSPECT]" : ""));
 
         boolean hasCameraPermission = CameraPermissionHelper.hasCameraPermission(activity);
 
@@ -841,8 +933,70 @@ public class ViroViewARCore extends ViroView {
         this.dispose();
     }
 
+    /**
+     * Idle the GL thread and pause the surface BEFORE the host React Native view
+     * is unmounted, so that the main thread does not block waiting for an in-flight
+     * GL frame when SurfaceView teardown runs on the next layout pass.
+     *
+     * Symptom this prevents: Background ANR with stack
+     *   java.lang.Object.wait ← GLSurfaceView$GLThread.surfaceDestroyed ←
+     *   SurfaceView.notifySurfaceDestroyed ← ScreenStack.endViewTransition
+     *
+     * The callback fires on the main thread once:
+     *  - a final opaque-black frame has been presented (no camera bleed-through
+     *    during the subsequent navigation transition), and
+     *  - the GLSurfaceView has been paused (no further render work queued).
+     *
+     * Safe to call multiple times and safe when the surface is already paused.
+     * Safe to call from any thread; the callback always runs on the main thread.
+     */
+    public void prepareForUnmount(final Runnable onReady) {
+        final GLSurfaceView surfaceView = mSurfaceView;
+        if (surfaceView == null) {
+            if (onReady != null) onReady.run();
+            return;
+        }
+
+        final Handler mainHandler = new Handler(Looper.getMainLooper());
+        final Renderer renderer = mNativeRenderer;
+
+        // Queue a final opaque-black clear on the GL thread, glFinish to guarantee
+        // it has been presented, then bounce back to the main thread to pause the
+        // surface + renderer and signal completion. After this returns, the GL
+        // thread is idle so surfaceDestroyed's Object.wait will acknowledge fast.
+        surfaceView.queueEvent(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    GLES20.glClearColor(0f, 0f, 0f, 1f);
+                    GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
+                    GLES20.glFinish();
+                } catch (Throwable t) {
+                    // Non-fatal: if the GL context is already gone, we still want
+                    // to proceed to pause and signal completion.
+                    Log.w(TAG, "prepareForUnmount: GL clear failed: " + t.getMessage());
+                }
+                mainHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            surfaceView.onPause();
+                            if (renderer != null) {
+                                renderer.onPause();
+                            }
+                        } catch (Throwable t) {
+                            Log.w(TAG, "prepareForUnmount: pause failed: " + t.getMessage());
+                        }
+                        if (onReady != null) onReady.run();
+                    }
+                });
+            }
+        });
+    }
+
     @Override
     public void dispose() {
+        Log.i(DIAG_TAG, "ViroViewARCore.dispose enter tid=" + Thread.currentThread().getId());
         if (mMediaRecorder != null) {
             mMediaRecorder.dispose();
         }
@@ -874,6 +1028,7 @@ public class ViroViewARCore extends ViroView {
             mPlatformUtil.dispose();
             mPlatformUtil = null;
         }
+        Log.i(DIAG_TAG, "ViroViewARCore.dispose exit");
     }
 
     /**

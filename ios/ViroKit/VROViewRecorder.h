@@ -96,6 +96,16 @@ private:
            saveToCameraRoll:(BOOL)saveToCamera
                  errorBlock:(VROViewRecordingErrorBlock)errorBlock;
 
+// Variant that interprets watermarkFrame as normalized [0..1] coordinates
+// from the output frame's top-left. Lets callers specify watermark placement
+// without knowing the actual recording resolution. Converted to points
+// internally when the watermark sprite is drawn.
+- (void)startVideoRecording:(NSString *)fileName
+              withWatermark:(UIImage *)watermarkImage
+        withNormalizedFrame:(CGRect)normalizedFrame
+           saveToCameraRoll:(BOOL)saveToCamera
+                 errorBlock:(VROViewRecordingErrorBlock)errorBlock;
+
 - (void)startVideoRecording:(NSString *)fileName
                     gifFile:(NSString *)gifFile
               withWatermark:(UIImage *)watermarkImage

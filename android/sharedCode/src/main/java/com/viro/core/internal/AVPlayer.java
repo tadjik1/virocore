@@ -34,7 +34,9 @@ import androidx.annotation.NonNull;
 import androidx.media3.common.C;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.PlaybackException;
+import androidx.media3.common.PlaybackParameters;
 import androidx.media3.common.Player;
+import androidx.media3.common.Timeline;
 import androidx.media3.common.util.Util;
 import androidx.media3.datasource.DataSource;
 import androidx.media3.datasource.DefaultDataSourceFactory;
@@ -82,10 +84,35 @@ public class AVPlayer {
     private float mVolume;
     private final long mNativeReference;
     private boolean mLoop;
-    private State mState;
+    // Mutated from the GL thread (via PlatformUtil task dispatch) while main-thread
+    // callbacks also read it — must be volatile. State transitions are applied on the
+    // calling thread; the ExoPlayer call itself is posted to the main thread so we
+    // never block the GL thread waiting for the main Looper (deadlocks onPause).
+    private volatile State mState;
     private boolean mMute;
     private int mPrevExoPlayerState = -1;
     private boolean mWasBuffering = false;
+
+    // Cached player state refreshed on the main thread. The GL thread reads these
+    // every frame via getCurrentTimeInSeconds / getVideoDurationInSeconds; routing
+    // those reads through runSynchronouslyOnMainThread deadlocks when the main
+    // thread is waiting on the GL thread (e.g. SurfaceView teardown).
+    private volatile long mCachedPositionMs = 0;
+    private volatile long mCachedDurationMs = C.TIME_UNSET;
+    private volatile long mPositionSyncNanos = 0;
+    private volatile float mPlaybackSpeed = 1.0f;
+    private volatile boolean mIsPlayingCached = false;
+
+    private static final long STATE_SYNC_INTERVAL_MS = 250;
+    private final Runnable mStateSyncer = new Runnable() {
+        @Override
+        public void run() {
+            if (mState != State.IDLE) {
+                syncCachedPlayerState();
+            }
+            mainThreadHandler.postDelayed(this, STATE_SYNC_INTERVAL_MS);
+        }
+    };
 
     public AVPlayer(long nativeReference, Context context) {
         mVolume = 1.0f;
@@ -136,12 +163,46 @@ public class AVPlayer {
                 Log.w(TAG, "AVPlayer encountered error [" + error + "]", error);
                 nativeOnError(mNativeReference, error.getLocalizedMessage());
             }
+
+            @Override
+            public void onTimelineChanged(@NonNull Timeline timeline, int reason) {
+                syncCachedPlayerState();
+            }
+
+            @Override
+            public void onPositionDiscontinuity(@NonNull Player.PositionInfo oldPosition,
+                                                @NonNull Player.PositionInfo newPosition,
+                                                int reason) {
+                syncCachedPlayerState();
+            }
+
+            @Override
+            public void onIsPlayingChanged(boolean isPlaying) {
+                syncCachedPlayerState();
+            }
+
+            @Override
+            public void onPlaybackParametersChanged(@NonNull PlaybackParameters playbackParameters) {
+                syncCachedPlayerState();
+            }
         });
+
+        mainThreadHandler.post(mStateSyncer);
     }
 
     @FunctionalInterface
     public interface PlayerAction<T> {
         T performAction(ExoPlayer player);
+    }
+
+    private void syncCachedPlayerState() {
+        // Must run on the main thread (ExoPlayer has thread-affinity). Called
+        // from Player.Listener callbacks and from the periodic mStateSyncer.
+        mCachedPositionMs = mExoPlayer.getCurrentPosition();
+        mCachedDurationMs = mExoPlayer.getDuration();
+        mPlaybackSpeed = mExoPlayer.getPlaybackParameters().speed;
+        mIsPlayingCached = mExoPlayer.isPlaying();
+        mPositionSyncNanos = System.nanoTime();
     }
 
     private <T> T runSynchronouslyOnMainThread(PlayerAction<T> action) throws ExecutionException, InterruptedException {
@@ -250,20 +311,20 @@ public class AVPlayer {
             runSynchronouslyOnMainThread(player -> {
                 player.setVideoSurface(videoSink);
                 return null;
-            });
+            }, false);
         } catch (Exception e) {
             Log.e(TAG, "AVPlayer failed to set video", e);
         }
     }
 
     public void reset() {
+        mState = State.IDLE;
         try {
             runSynchronouslyOnMainThread(player -> {
                 player.stop();
                 player.seekToDefaultPosition();
-                mState = State.IDLE;
                 return null;
-            });
+            }, false);
             Log.i(TAG, "AVPlayer reset");
         } catch (Exception e) {
             Log.e(TAG, "AVPlayer failed reset", e);
@@ -271,6 +332,7 @@ public class AVPlayer {
     }
 
     public void destroy() {
+        mainThreadHandler.removeCallbacks(mStateSyncer);
         try {
             runSynchronouslyOnMainThread(player -> {
                     player.stop();
@@ -289,12 +351,12 @@ public class AVPlayer {
 
     public void play() {
         if (mState == State.PREPARED || mState == State.PAUSED) {
+            mState = State.STARTED;
             try {
                 runSynchronouslyOnMainThread(player -> {
                     player.setPlayWhenReady(true);
-                    mState = State.STARTED;
                     return null;
-                });
+                }, false);
             } catch (Exception e) {
                 Log.e(TAG, "AVPlayer failed to play video", e);
             }
@@ -305,12 +367,12 @@ public class AVPlayer {
 
     public void pause() {
         if (mState == State.STARTED) {
+            mState = State.PAUSED;
             try {
                 runSynchronouslyOnMainThread(player -> {
                     player.setPlayWhenReady(false);
-                    mState = State.PAUSED;
                     return null;
-                });
+                }, false);
             } catch (Exception e) {
                 Log.e(TAG, "AVPlayer failed to pause video", e);
             }
@@ -331,7 +393,7 @@ public class AVPlayer {
                     player.seekToDefaultPosition();
                 }
                 return null;
-            });
+            }, false);
         } catch (Exception e) {
             Log.e(TAG, "AVPlayer failed to set loop", e);
         }
@@ -346,7 +408,7 @@ public class AVPlayer {
             runSynchronouslyOnMainThread(player -> {
                 player.setVolume(mVolume);
                 return null;
-            });
+            }, false);
         } catch (Exception e) {
             Log.e(TAG, "AVPlayer failed to set volume", e);
         }
@@ -362,7 +424,7 @@ public class AVPlayer {
                     player.setVolume(mVolume);
                 }
                 return null;
-            });
+            }, false);
         } catch (Exception e) {
             Log.e(TAG, "AVPlayer failed to set muted " + muted, e);
         }
@@ -377,7 +439,7 @@ public class AVPlayer {
             runSynchronouslyOnMainThread(player -> {
                 player.seekTo((long) (seconds * 1000));
                 return null;
-            });
+            }, false);
         } catch (Exception e) {
             Log.e(TAG, "AVPlayer failed to seek", e);
         }
@@ -389,14 +451,12 @@ public class AVPlayer {
             return 0;
         }
 
-        long currentPosition = 0;
-        try {
-            currentPosition = runSynchronouslyOnMainThread(player -> player.getCurrentPosition());
-        } catch (Exception e) {
-            Log.e(TAG, "AVPlayer could not get video current position", e);
+        long positionMs = mCachedPositionMs;
+        if (mIsPlayingCached) {
+            long elapsedNanos = System.nanoTime() - mPositionSyncNanos;
+            positionMs += (long) ((elapsedNanos / 1_000_000.0) * mPlaybackSpeed);
         }
-
-        return currentPosition / 1000.0f;
+        return positionMs / 1000.0f;
     }
 
     public float getVideoDurationInSeconds() {
@@ -405,16 +465,10 @@ public class AVPlayer {
             return 0;
         }
 
-        long duration = 0;
-        try {
-            duration = runSynchronouslyOnMainThread(player -> player.getDuration());
-        } catch (Exception e) {
-            Log.e(TAG, "AVPlayer could not get video duration", e);
-        }
+        long duration = mCachedDurationMs;
         if (duration == C.TIME_UNSET) {
             return 0;
         }
-
         return duration / 1000.0f;
     }
 
